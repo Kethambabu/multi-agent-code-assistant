@@ -1,0 +1,525 @@
+# Transform Multi-Agent Analyzer → Autonomous Code Assistant
+
+## Overview
+
+Transform the existing **code analysis** system (text-in → text-out) into an **autonomous code assistant** that reads/writes real project files, creates new projects from scratch, and executes code — all driven by natural language prompts.
+
+### Current Architecture (What We Have)
+
+```
+src/
+├── config.py              ← HuggingFace config, env loader
+├── llm/
+│   ├── provider.py        ← LLMProvider protocol (duck-typing interface)
+│   ├── client.py          ← Raw HTTP calls to HF API
+│   └── huggingface.py     ← HuggingFaceLLM with retry
+├── agents/
+│   ├── base.py            ← BaseAgent ABC + AgentRegistry + AgentResult
+│   ├── completion.py      ← Code completion (text → text)
+│   ├── debug.py           ← Bug detection (text → text)
+│   ├── explain.py         ← Code explanation (text → text)
+│   └── test.py            ← Test generation (text → text)
+├── tools/
+│   ├── ast_parser.py      ← AST extraction (pure functions on strings)
+│   ├── bug_detector.py    ← Static bug detection (pure functions)
+│   └── context_extractor.py ← Cursor context (pure functions)
+├── memory/
+│   ├── store.py           ← MemoryStore (code snapshots, responses)
+│   └── context.py         ← Read-only MemoryContext for agents
+├── engine/
+│   └── trigger.py         ← Event detection & agent routing
+├── orchestration/
+│   ├── tasks.py           ← TaskType, TaskDefinition, TaskRegistry
+│   └── crew.py            ← CrewWorkflow orchestrator
+└── ui/
+    └── streamlit_app.py   ← Streamlit UI (paste code → analyze)
+```
+
+### Target Architecture (What We're Building)
+
+```
+SAME AS ABOVE, PLUS:
+├── workspace/             ← [NEW] Runtime project files directory
+├── src/
+│   ├── file_manager.py    ← [NEW] PHASE 1 — File CRUD operations
+│   ├── project_handler.py ← [NEW] PHASE 2 — Upload/init projects
+│   ├── agents/
+│   │   └── editor.py      ← [NEW] PHASE 3 — File-editing agent
+│   │   └── creator.py     ← [NEW] PHASE 4 — Project creation agent
+│   ├── file_selector.py   ← [NEW] PHASE 5 — Intelligent file targeting
+│   ├── runner.py          ← [NEW] PHASE 6 — Code execution engine
+│   ├── pipeline.py        ← [NEW] PHASE 7 — End-to-end pipeline
+│   └── ui/
+│       └── streamlit_app.py ← [MODIFY] PHASE 8 — Full assistant UI
+```
+
+---
+
+## User Review Required
+
+> [!IMPORTANT]
+> **Workspace Location**: The plan uses `workspace/` directory inside the project root (`c:\Users\CSE\Documents\miltiagent234\workspace\`). Should we use a different location, like a temp directory or user-configurable path?
+
+> [!IMPORTANT]
+> **Execution Safety**: Phase 6 adds `subprocess` execution. Currently scoped to **Python files only** with a 30-second timeout. Do you want additional sandboxing (e.g., restricted imports, virtual environment isolation)?
+
+> [!WARNING]
+> **LLM Model Capability**: The current model (`Qwen/Qwen2.5-Coder-32B-Instruct`) is used for analysis. For file editing (Phase 3) and project creation (Phase 4), it needs to return **complete, valid code files**. The prompts are designed for this, but results depend on model quality. We can add validation/retry logic.
+
+---
+
+## Proposed Changes
+
+---
+
+### PHASE 1: Workspace & File Manager
+
+**Goal**: Replace "code string" inputs with real file I/O. All subsequent phases depend on this.
+
+#### [NEW] [file_manager.py](file:///c:/Users/CSE/Documents/miltiagent234/src/file_manager.py)
+
+Create a `FileManager` class with these operations:
+
+```python
+class FileManager:
+    def __init__(self, workspace_root: str)
+    def read_file(self, relative_path: str) -> str
+    def write_file(self, relative_path: str, content: str) -> None
+    def create_file(self, relative_path: str, content: str = "") -> None
+    def delete_file(self, relative_path: str) -> None
+    def list_files(self, extension_filter: Optional[str] = None) -> List[str]
+    def file_exists(self, relative_path: str) -> bool
+    def get_workspace_root(self) -> str
+```
+
+**Key design decisions**:
+- All paths are **relative to workspace root** (prevents path traversal attacks)
+- Path validation rejects `..`, absolute paths, and paths outside workspace
+- Creates parent directories automatically on `write_file`/`create_file`
+- `list_files` walks recursively, excludes `__pycache__`, `.git`, `venv`
+
+#### [NEW] workspace/ directory
+
+Create empty `workspace/` directory at project root. Add `.gitkeep` so git tracks it.
+
+#### [MODIFY] [config.py](file:///c:/Users/CSE/Documents/miltiagent234/src/config.py)
+
+Add `WorkspaceConfig` dataclass and include it in `SystemConfig`:
+
+```python
+@dataclass(frozen=True)
+class WorkspaceConfig:
+    root_dir: str = "workspace"
+    max_file_size_bytes: int = 1_000_000  # 1MB
+    allowed_extensions: tuple = (".py", ".txt", ".json", ".yaml", ".yml", ".toml", ".md", ".html", ".css", ".js")
+```
+
+**Validation**: Run `python -c "from src.file_manager import FileManager; fm = FileManager('workspace'); fm.create_file('test.py', 'print(1)'); print(fm.read_file('test.py'))"` → should print `print(1)`.
+
+---
+
+### PHASE 2: Project Handling
+
+**Goal**: Support uploading a zip project or starting with an empty workspace.
+
+#### [NEW] [project_handler.py](file:///c:/Users/CSE/Documents/miltiagent234/src/project_handler.py)
+
+```python
+class ProjectHandler:
+    def __init__(self, file_manager: FileManager)
+    def upload_project(self, zip_bytes: bytes) -> Dict[str, Any]
+        # Extract zip → workspace, return {"files": [...], "project_path": "..."}
+    def init_empty_workspace(self) -> None
+        # Clear workspace, create fresh directory
+    def get_project_info(self) -> Dict[str, Any]
+        # Return {"files": [...], "total_files": N, "has_project": bool}
+    def clear_workspace(self) -> None
+```
+
+**Key design decisions**:
+- Uses `FileManager` (injected) — no direct filesystem calls
+- ZIP extraction validates file paths (no zip-slip vulnerability)
+- Skips `__pycache__`, `.git`, `venv/` during extraction
+- Maintains `current_project_path` state
+
+**Validation**: Upload a zip file via Python script → verify files appear in `workspace/`.
+
+---
+
+### PHASE 3: Upgrade Agents to File Editors
+
+**Goal**: A new `EditorAgent` that reads files from disk, sends to LLM with edit instructions, and writes modified code back to disk.
+
+#### [NEW] [editor.py](file:///c:/Users/CSE/Documents/miltiagent234/src/agents/editor.py)
+
+```python
+class EditorAgent(BaseAgent):
+    """Reads a file, sends to LLM with user prompt, writes updated code back."""
+    
+    def __init__(self, llm: LLMProvider, file_manager: FileManager):
+        super().__init__(llm)
+        self.file_manager = file_manager
+    
+    @property
+    def role(self) -> str: return "Code Editor"
+    
+    @property
+    def goal(self) -> str: return "Modify project files based on user instructions"
+    
+    def execute(self, context: str, file_path: str = "", prompt: str = "", **kwargs) -> AgentResult:
+        # 1. Read file from disk via self.file_manager
+        # 2. Build LLM prompt: "Here is the file. Apply this change: {prompt}"
+        # 3. Send to LLM, receive modified code
+        # 4. Extract code from LLM response (strip markdown fences)
+        # 5. Write modified code back to disk
+        # 6. Return AgentResult with diff summary
+```
+
+**Integration with existing system**:
+- Inherits from existing `BaseAgent` (same `role`/`goal`/`execute` interface)
+- Uses existing `LLMProvider` protocol — zero changes to LLM layer
+- Registered in `AgentRegistry` (same pattern as debug/explain/test)
+- NEW dependency: `FileManager` injected via constructor
+
+**Prompt engineering for LLM**:
+- System prompt explicitly says "Return ONLY the complete modified file, no explanations"
+- Includes file extension in prompt so LLM knows the language
+- Strips markdown code fences from response before writing
+
+**Validation**: Create a test file, run `EditorAgent.execute(prompt="Add a logging import")` → verify file has `import logging` added.
+
+---
+
+### PHASE 4: Project Creation Capability
+
+**Goal**: When workspace is empty, generate a full project structure via LLM.
+
+#### [NEW] [creator.py](file:///c:/Users/CSE/Documents/miltiagent234/src/agents/creator.py)
+
+```python
+class CreatorAgent(BaseAgent):
+    """Creates new project structure from a description."""
+    
+    def __init__(self, llm: LLMProvider, file_manager: FileManager):
+        super().__init__(llm)
+        self.file_manager = file_manager
+    
+    def execute(self, context: str, prompt: str = "", **kwargs) -> AgentResult:
+        # 1. Send prompt to LLM: "Generate a project structure for: {prompt}"
+        # 2. LLM returns JSON: {"files": {"main.py": "code...", "utils.py": "code..."}}
+        # 3. Parse JSON response
+        # 4. Create each file via file_manager.create_file()
+        # 5. Return AgentResult with list of created files
+```
+
+**LLM prompt design**:
+```
+Create a Python project for: {user_prompt}
+Return ONLY a JSON object with this exact format:
+{
+  "files": {
+    "main.py": "complete python code here",
+    "utils.py": "complete python code here",
+    "requirements.txt": "package1\npackage2"
+  }
+}
+```
+
+**Validation**: Run `CreatorAgent.execute(prompt="Create a Flask REST API")` → verify `main.py`, `requirements.txt` etc. appear in workspace.
+
+---
+
+### PHASE 5: Intelligent File Selection
+
+**Goal**: Given a user prompt like "Fix the login bug", automatically identify which file(s) to modify.
+
+#### [NEW] [file_selector.py](file:///c:/Users/CSE/Documents/miltiagent234/src/file_selector.py)
+
+```python
+class FileSelector:
+    def __init__(self, file_manager: FileManager, llm: LLMProvider):
+        self.file_manager = file_manager
+        self.llm = llm
+    
+    def select_files(self, prompt: str) -> List[str]:
+        # Strategy 1: Keyword heuristic (fast, no LLM call)
+        #   - "login" → search files for "login", "auth", "user"
+        #   - "database" → search for "db", "model", "sql"
+        #   - "test" → search for "test_", "_test"
+        
+        # Strategy 2: LLM-based selection (accurate, 1 LLM call)
+        #   - List all files with first 5 lines of each
+        #   - Ask LLM: "Which files should be modified for: {prompt}?"
+        #   - Parse response into file list
+        
+        # Returns: ["auth/login.py", "models/user.py"]
+    
+    def _keyword_search(self, prompt: str) -> List[str]:
+        # Scan file names and contents for keyword matches
+    
+    def _llm_select(self, prompt: str, file_summaries: Dict[str, str]) -> List[str]:
+        # Ask LLM to pick files from the list
+```
+
+**Two-tier selection**:
+1. **Fast pass**: Keyword matching on filenames and file content (grep-like)
+2. **Smart pass**: If fast pass returns 0 or >5 files, use LLM to refine
+
+**Validation**: Create a multi-file project, prompt "Fix the database connection" → verify it selects the right file(s).
+
+---
+
+### PHASE 6: Execution Engine
+
+**Goal**: Run Python projects and capture stdout/stderr.
+
+#### [NEW] [runner.py](file:///c:/Users/CSE/Documents/miltiagent234/src/runner.py)
+
+```python
+class ProjectRunner:
+    def __init__(self, file_manager: FileManager):
+        self.file_manager = file_manager
+        self.timeout = 30  # seconds
+    
+    def run(self, entry_point: str = "main.py") -> RunResult:
+        # 1. Resolve full path: workspace_root / entry_point
+        # 2. Verify file exists
+        # 3. Execute: subprocess.run(["python", full_path], capture_output=True, timeout=30)
+        # 4. Return RunResult(stdout, stderr, return_code, execution_time)
+    
+    def detect_entry_point(self) -> Optional[str]:
+        # Check for main.py, app.py, run.py, manage.py
+        # If none found, return first .py file or None
+
+@dataclass
+class RunResult:
+    stdout: str
+    stderr: str
+    return_code: int
+    execution_time_ms: float
+    entry_point: str
+    success: bool  # return_code == 0
+```
+
+**Safety features**:
+- 30-second timeout (configurable)
+- Working directory set to workspace root
+- Captures both stdout and stderr
+- Returns structured `RunResult` (not raw subprocess output)
+
+**Validation**: Create `workspace/main.py` with `print("Hello")` → run → verify stdout = "Hello".
+
+---
+
+### PHASE 7: Full Pipeline Integration
+
+**Goal**: Wire everything together: prompt → file selection → modification → save → run.
+
+#### [NEW] [pipeline.py](file:///c:/Users/CSE/Documents/miltiagent234/src/pipeline.py)
+
+```python
+class AssistantPipeline:
+    """End-to-end pipeline: prompt → files → edit → save → run."""
+    
+    def __init__(self, config: SystemConfig):
+        # Initialize all components via dependency injection
+        self.file_manager = FileManager(config.workspace.root_dir)
+        self.llm = HuggingFaceLLM(config.hf)
+        self.project_handler = ProjectHandler(self.file_manager)
+        self.file_selector = FileSelector(self.file_manager, self.llm)
+        self.editor = EditorAgent(self.llm, self.file_manager)
+        self.creator = CreatorAgent(self.llm, self.file_manager)
+        self.runner = ProjectRunner(self.file_manager)
+        
+        # Keep existing agents for analysis features
+        self.registry = AgentRegistry()
+        self.registry.register("editor", self.editor)
+        self.registry.register("creator", self.creator)
+        self.registry.register("debug", DebugAgent(self.llm))
+        self.registry.register("explain", ExplainAgent(self.llm))
+        self.registry.register("test", TestAgent(self.llm))
+    
+    def process_prompt(self, prompt: str) -> PipelineResult:
+        # 1. Check if workspace is empty
+        #    → YES: Use CreatorAgent to generate project
+        #    → NO:  Use FileSelector to pick files
+        # 2. For each selected file:
+        #    → EditorAgent.execute(file_path, prompt)
+        # 3. Return PipelineResult with modified files and status
+    
+    def upload_project(self, zip_bytes: bytes) -> Dict:
+        return self.project_handler.upload_project(zip_bytes)
+    
+    def run_project(self, entry_point: str = None) -> RunResult:
+        if not entry_point:
+            entry_point = self.runner.detect_entry_point()
+        return self.runner.run(entry_point)
+    
+    def get_project_info(self) -> Dict:
+        return self.project_handler.get_project_info()
+```
+
+**How it connects with existing system**:
+- `AssistantPipeline` replaces `DeveloperAssistantSystem` as the main entry point
+- Existing agents (debug, explain, test) are **still registered** for analysis features
+- The `CrewWorkflow` orchestrator remains available but is not on the critical path
+- Config loading uses the same `load_config()` with the new `WorkspaceConfig`
+
+#### [MODIFY] [config.py](file:///c:/Users/CSE/Documents/miltiagent234/src/config.py)
+
+Add `WorkspaceConfig` to `SystemConfig` (done in Phase 1 but wired here):
+
+```python
+@dataclass(frozen=True)
+class SystemConfig:
+    hf: HuggingFaceConfig = ...
+    memory: MemoryConfig = ...
+    engine: EngineConfig = ...
+    workspace: WorkspaceConfig = field(default_factory=WorkspaceConfig)  # NEW
+    enable_logging: bool = True
+```
+
+**Validation**: Run complete pipeline test: create project → edit file → run → verify output.
+
+---
+
+### PHASE 8: Update UI
+
+**Goal**: Replace the "paste code" UI with a full assistant interface.
+
+#### [MODIFY] [streamlit_app.py](file:///c:/Users/CSE/Documents/miltiagent234/src/ui/streamlit_app.py)
+
+Major UI changes (preserving existing display_result logic):
+
+**New UI Layout**:
+```
+┌─────────────────────────────────────────────────────────┐
+│  🤖 AI Code Assistant                                   │
+├──────────────┬──────────────────────────────────────────┤
+│  SIDEBAR     │  MAIN AREA                               │
+│              │                                          │
+│  📁 Upload   │  💬 Prompt Input                          │
+│    Project   │  ┌──────────────────────────────────┐    │
+│              │  │ "Add login system with JWT..."   │    │
+│  📂 Files    │  └──────────────────────────────────┘    │
+│  ├ main.py   │                                          │
+│  ├ auth.py   │  [🔨 Apply Changes]  [▶️ Run Project]    │
+│  └ utils.py  │                                          │
+│              │  📝 Modified Files                        │
+│  ⚙️ Settings │  ┌──────────────────────────────────┐    │
+│              │  │ auth.py (modified)               │    │
+│  📊 Old      │  │ + import jwt                     │    │
+│   Analysis   │  │ + def login():                   │    │
+│   Tools      │  └──────────────────────────────────┘    │
+│              │                                          │
+│              │  ▶️ Execution Output                      │
+│              │  ┌──────────────────────────────────┐    │
+│              │  │ $ python main.py                 │    │
+│              │  │ Server running on port 5000      │    │
+│              │  └──────────────────────────────────┘    │
+└──────────────┴──────────────────────────────────────────┘
+```
+
+**Key changes**:
+1. **Sidebar**: Project upload (zip) + file browser + legacy analysis tools
+2. **Main area**: Prompt input → Apply Changes button → Run button
+3. **File viewer**: Show file contents with syntax highlighting  
+4. **Output panel**: Show execution stdout/stderr with color coding
+5. **Backward compatible**: Keep existing Explain/Debug/Test buttons in a collapsible sidebar section
+
+**Backend wiring**:
+- `st.cache_resource` initializes `AssistantPipeline` (replaces current `get_backend()`)
+- Upload button → `pipeline.upload_project(zip_bytes)`
+- Apply Changes button → `pipeline.process_prompt(user_prompt)`
+- Run button → `pipeline.run_project()`
+- File browser → `pipeline.get_project_info()`
+
+**Validation**: Full manual E2E test:
+1. Upload a zip project
+2. Type "Add error handling to all functions"
+3. Click Apply Changes → verify files modified
+4. Click Run → verify output shows
+
+---
+
+## Open Questions
+
+> [!IMPORTANT]
+> **Q1**: Should the old analysis features (Explain, Debug, Test from the code editor) remain in the UI as a secondary panel, or should they be removed entirely?
+
+> [!IMPORTANT]
+> **Q2**: For Phase 6 execution — should we support only Python, or also Node.js, Java, etc.? This affects the runner's entry-point detection logic.
+
+> [!NOTE]
+> **Q3**: The current `CrewWorkflow` and `TriggerEngine` — should we keep them wired in the new pipeline for real-time analysis, or archive them as unused for now?
+
+---
+
+## Verification Plan
+
+### Automated Tests
+
+Each phase has an inline validation step. After all phases, run:
+
+```bash
+# Test file_manager
+python -c "from src.file_manager import FileManager; fm = FileManager('workspace'); fm.create_file('hello.py', 'print(\"hello\")'); assert fm.read_file('hello.py') == 'print(\"hello\")'; print('PASS')"
+
+# Test project_handler
+python -c "from src.file_manager import FileManager; from src.project_handler import ProjectHandler; ph = ProjectHandler(FileManager('workspace')); info = ph.get_project_info(); print(info)"
+
+# Test runner
+python -c "from src.file_manager import FileManager; from src.runner import ProjectRunner; r = ProjectRunner(FileManager('workspace')); result = r.run('hello.py'); print(result.stdout)"
+
+# Test full pipeline (requires HF API key)
+python -c "from src.config import load_config; from src.pipeline import AssistantPipeline; p = AssistantPipeline(load_config()); print(p.get_project_info())"
+```
+
+### Manual Verification
+
+After Phase 8, run the Streamlit app and test the complete flow:
+```bash
+streamlit run src/ui/streamlit_app.py
+```
+
+1. ✅ Upload a zip project → files appear in sidebar
+2. ✅ Type a prompt → click Apply Changes → files modified
+3. ✅ Click Run → output shown
+4. ✅ Start with no project → type "Create a calculator" → project created
+5. ✅ Old analysis tools still work from sidebar
+
+---
+
+## Dependency Graph (No Circular Dependencies)
+
+```mermaid
+graph TD
+    config[config.py] --> file_manager[file_manager.py]
+    config --> llm[llm/huggingface.py]
+    
+    file_manager --> project_handler[project_handler.py]
+    file_manager --> runner[runner.py]
+    file_manager --> file_selector[file_selector.py]
+    
+    llm --> editor[agents/editor.py]
+    llm --> creator[agents/creator.py]
+    llm --> file_selector
+    
+    file_manager --> editor
+    file_manager --> creator
+    
+    editor --> pipeline[pipeline.py]
+    creator --> pipeline
+    file_selector --> pipeline
+    runner --> pipeline
+    project_handler --> pipeline
+    
+    pipeline --> ui[ui/streamlit_app.py]
+    
+    style config fill:#e1f5fe
+    style file_manager fill:#c8e6c9
+    style pipeline fill:#fff3e0
+    style ui fill:#fce4ec
+```
+
+All arrows point **downward** — no circular dependencies. UI depends on pipeline, pipeline depends on components, components depend on config/llm.
