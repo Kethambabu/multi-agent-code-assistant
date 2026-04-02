@@ -21,8 +21,9 @@ if __name__ == '__main__':
     # Check if running in test/runner mode (non-interactive)
     if os.getenv('FLASK_TEST_MODE') or os.getenv('RUNNER_MODE'):
         # Just verify the app loads successfully
-        print(f"✅ Flask app loaded successfully with {len(app.url_map._rules)} routes")
-        print(f"Routes: {[rule.rule for rule in app.url_map.iter_rules() if rule.endpoint != 'static']}")
+        print(f"[OK] Flask app loaded successfully with {len(app.url_map._rules)} routes")
+        routes = [rule.rule for rule in app.url_map.iter_rules() if rule.endpoint != 'static']
+        print(f"Routes: {routes}")
         sys.exit(0)
     else:
         # Normal interactive mode
