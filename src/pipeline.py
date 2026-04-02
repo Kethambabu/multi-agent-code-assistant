@@ -17,7 +17,8 @@ from src.config import SystemConfig, load_config
 from src.file_manager import FileManager
 from src.project_handler import ProjectHandler
 from src.file_selector import FileSelector
-from src.runner import ProjectRunner, RunResult
+from src.error_driven_selector import ErrorDrivenFileSelector
+from src.file_validator import FileValidator
 from src.llm.huggingface import HuggingFaceLLM
 from src.agents.base import AgentRegistry, AgentResult
 from src.agents.editor import EditorAgent
@@ -41,7 +42,6 @@ class PipelineResult:
     modified_files: List[str] = field(default_factory=list)
     created_files: List[str] = field(default_factory=list)
     agent_results: List[AgentResult] = field(default_factory=list)
-    run_result: Optional[RunResult] = None
     error: Optional[str] = None
 
 
@@ -84,13 +84,13 @@ class AssistantPipeline:
         # 3. File selection
         self.file_selector = FileSelector(self.file_manager, self.llm)
 
-        # 4. Execution engine
-        self.runner = ProjectRunner(
-            self.file_manager,
-            timeout=config.runner.timeout_seconds,
-        )
+        # 4. Error-driven file selection
+        self.error_selector = ErrorDrivenFileSelector(self.file_manager)
 
-        # 5. Agents (new + existing)
+        # 5. File validation
+        self.file_validator = FileValidator(self.file_manager)
+
+        # 4. Agents (new + existing)
         self.editor = EditorAgent(self.llm, self.file_manager)
         self.creator = CreatorAgent(self.llm, self.file_manager)
 
@@ -102,7 +102,7 @@ class AssistantPipeline:
         self.registry.register("test", TestAgent(self.llm))
         logger.info(f"✓ Agents initialized ({len(self.registry.list_agents())} agents)")
 
-        # 6. Memory (retained for analysis agents)
+        # 5. Memory (retained for analysis agents)
         self.memory = MemoryStore(
             max_history=config.memory.max_history,
             max_snapshots=config.memory.max_snapshots,
@@ -168,8 +168,8 @@ class AssistantPipeline:
 
     def _edit_project(self, prompt: str) -> PipelineResult:
         """Edit existing project files based on prompt."""
-        # 1. Select files to modify
-        target_files = self.file_selector.select_files(prompt)
+        # 1. Select files to modify - try error-driven first, then fallback to regular
+        target_files = self._select_files_for_editing(prompt)
         logger.info(f"Selected {len(target_files)} file(s) to modify: {target_files}")
 
         if not target_files:
@@ -191,12 +191,34 @@ class AssistantPipeline:
             )
             agent_results.append(result)
 
-            if result.success:
-                modified_files.append(file_path)
+            if result.success and result.metadata:
+                # Validate the modified content before writing
+                modified_code = result.metadata.get("modified_code")
+                if modified_code is not None:
+                    is_valid, validation_error = self.file_validator.validate_modification(
+                        file_path, modified_code
+                    )
+
+                    if is_valid:
+                        # Write the validated content
+                        try:
+                            self.file_manager.write_file(file_path, modified_code)
+                            modified_files.append(file_path)
+                            logger.info(f"Successfully modified and validated: {file_path}")
+                        except Exception as e:
+                            logger.error(f"Failed to write {file_path}: {e}")
+                            result.error = f"Write failed: {e}"
+                            result.success = False
+                    else:
+                        logger.warning(f"Validation failed for {file_path}: {validation_error}")
+                        result.error = f"Validation failed: {validation_error}"
+                        result.success = False
+                else:
+                    logger.warning(f"No modified code returned for {file_path}")
+                    result.error = "No modified code generated"
+                    result.success = False
             else:
-                logger.warning(
-                    f"Failed to edit {file_path}: {result.error}"
-                )
+                logger.warning(f"Failed to edit {file_path}: {result.error}")
 
         # 3. Build summary
         if modified_files:
@@ -221,6 +243,26 @@ class AssistantPipeline:
                 agent_results=agent_results,
             )
 
+    def _select_files_for_editing(self, prompt: str) -> List[str]:
+        """
+        Select files for editing using error-driven selection when possible.
+
+        Args:
+            prompt: User's instruction which may contain error traces.
+
+        Returns:
+            List of file paths to modify.
+        """
+        # First try error-driven selection (looks for stack traces, error messages)
+        error_files = self.error_selector.select_files_from_error(prompt)
+        if error_files:
+            logger.info(f"Error-driven selection found {len(error_files)} files: {error_files}")
+            return error_files
+
+        # Fallback to regular file selection
+        logger.info("No error traces found, using regular file selection")
+        return self.file_selector.select_files(prompt)
+
     # ------------------------------------------------------------------
     # Project management
     # ------------------------------------------------------------------
@@ -244,22 +286,6 @@ class AssistantPipeline:
     def get_project_info(self) -> Dict[str, Any]:
         """Get current project information."""
         return self.project_handler.get_project_info()
-
-    # ------------------------------------------------------------------
-    # Execution
-    # ------------------------------------------------------------------
-
-    def run_project(self, entry_point: Optional[str] = None) -> RunResult:
-        """
-        Execute the project and return results.
-
-        Args:
-            entry_point: Python file to run. Auto-detects if None.
-
-        Returns:
-            RunResult with stdout, stderr, timing, etc.
-        """
-        return self.runner.run(entry_point)
 
     # ------------------------------------------------------------------
     # File operations (direct access)
@@ -299,7 +325,6 @@ class AssistantPipeline:
             "agents": self.registry.list_agents(),
             "model": self.config.hf.model,
             "workspace": self.get_project_info(),
-            "entry_point": self.runner.detect_entry_point(),
             "memory": self.memory.get_statistics(),
         }
 

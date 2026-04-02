@@ -126,20 +126,20 @@ class EditorAgent(BaseAgent):
                     error="LLM returned empty code. File was not modified.",
                 )
 
-            # 6. Write modified code back to disk
-            self.file_manager.write_file(file_path, modified_code)
-            logger.info(f"Wrote modified file: {file_path} ({len(modified_code)} chars)")
+            # 6. Return modified code for validation (don't write yet)
+            logger.info(f"Generated modified code: {file_path} ({len(modified_code)} chars)")
 
             # 7. Build change summary
             diff_summary = self._build_diff_summary(original_code, modified_code)
 
             return AgentResult(
                 success=True,
-                output=f"✅ Modified `{file_path}`\n\n{diff_summary}",
+                output=f"✅ Generated modifications for `{file_path}`\n\n{diff_summary}",
                 metadata={
                     "file_path": file_path,
                     "original_length": len(original_code),
                     "modified_length": len(modified_code),
+                    "modified_code": modified_code,  # Return content for validation
                     "instruction": prompt[:100],
                 },
             )

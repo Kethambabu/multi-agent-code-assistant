@@ -22,7 +22,6 @@ if PROJECT_ROOT not in sys.path:
 
 from src.config import load_config, ConfigError
 from src.pipeline import AssistantPipeline, PipelineResult
-from src.runner import RunResult
 
 
 # ============================================================================
@@ -175,7 +174,6 @@ def init_session_state():
     """Initialize session state variables."""
     defaults = {
         "pipeline_result": None,
-        "run_result": None,
         "selected_file": None,
         "prompt_history": [],
         "active_tab": "assistant",
@@ -212,33 +210,6 @@ def display_pipeline_result(result: PipelineResult):
             err = getattr(agent_result, "error", None)
             if err:
                 st.error(err)
-
-
-def display_run_result(result: RunResult):
-    """Display execution result in terminal style."""
-    status_icon = "✅" if result.success else "❌"
-    st.markdown(
-        f"**{status_icon} `python {result.entry_point}`** — "
-        f"{result.execution_time_ms:.0f}ms | exit code {result.return_code}"
-    )
-
-    if result.stdout.strip():
-        st.markdown("**stdout:**")
-        st.markdown(
-            f'<div class="terminal-output">{_escape_html(result.stdout.strip())}</div>',
-            unsafe_allow_html=True,
-        )
-
-    if result.stderr.strip():
-        st.markdown("**stderr:**")
-        st.markdown(
-            f'<div class="terminal-output" style="border-color: rgba(239,68,68,0.3);">'
-            f'{_escape_html(result.stderr.strip())}</div>',
-            unsafe_allow_html=True,
-        )
-
-    if not result.stdout.strip() and not result.stderr.strip():
-        st.info("_(no output)_")
 
 
 def display_file_content(pipeline, file_path: str):
@@ -410,7 +381,7 @@ prompt_input = st.text_area(
 )
 
 # ---- Action Buttons ----
-col_apply, col_run, col_spacer = st.columns([1, 1, 3])
+col_apply, col_spacer = st.columns([1, 4])
 
 with col_apply:
     btn_apply = st.button(
@@ -420,26 +391,11 @@ with col_apply:
         disabled=not prompt_input.strip(),
     )
 
-with col_run:
-    btn_run = st.button(
-        "▶️ Run Project",
-        use_container_width=True,
-        disabled=not project_info["has_project"],
-    )
-
 # ---- Handle Apply Changes ----
 if btn_apply and prompt_input.strip():
     with st.spinner("🤖 AI is working on your request..."):
         result = pipeline.process_prompt(prompt_input.strip())
         st.session_state.pipeline_result = result
-        st.session_state.run_result = None  # Clear old run result
-        st.rerun()
-
-# ---- Handle Run Project ----
-if btn_run:
-    with st.spinner("▶️ Running project..."):
-        run_result = pipeline.run_project()
-        st.session_state.run_result = run_result
         st.rerun()
 
 # ---- Display Results ----
@@ -451,10 +407,6 @@ if st.session_state.pipeline_result:
     display_pipeline_result(st.session_state.pipeline_result)
 
 # Execution result (from Run)
-if st.session_state.run_result:
-    st.markdown("### ▶️ Execution Output")
-    display_run_result(st.session_state.run_result)
-
 # File viewer (from sidebar click)
 if st.session_state.selected_file:
     st.markdown(f"### 📄 `{st.session_state.selected_file}`")
@@ -462,10 +414,9 @@ if st.session_state.selected_file:
 
 # ---- Empty state ----
 if (not st.session_state.pipeline_result
-    and not st.session_state.run_result
     and not st.session_state.selected_file):
     st.markdown("---")
-    c1, c2, c3 = st.columns(3)
+    c1, c2 = st.columns(2)
     with c1:
         st.markdown("""
         **📦 Upload a Project**
@@ -477,12 +428,6 @@ if (not st.session_state.pipeline_result
         **🛠️ Create or Edit**
 
         Type a prompt above and click **Apply Changes** to modify files.
-        """)
-    with c3:
-        st.markdown("""
-        **▶️ Run & Test**
-
-        Click **Run Project** to execute and see console output.
         """)
 
 # ---- Footer ----
